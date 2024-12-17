@@ -13,56 +13,25 @@ static const char *TAG = "SH1106";
 
 // I2C bus handle and device handle
 static i2c_master_bus_handle_t bus_handle;
-static i2c_master_dev_handle_t dev_handle;
+extern i2c_master_dev_handle_t dev_handle;
 
 // Initialize SH1106 display descriptor
 esp_err_t sh1106_init_desc(sh1106_t *oled, i2c_port_t i2c_num, int sda_io, int scl_io) {
-    if (bus_handle != NULL) {
-        ESP_LOGW(TAG, "I2C bus already initialized. Releasing it first.");
-        i2c_master_bus_rm_device(dev_handle);
-        i2c_del_master_bus(bus_handle);
-        bus_handle = NULL;
-    }
-
-    i2c_master_bus_config_t bus_conf = {
-        .clk_source = I2C_CLK_SRC_DEFAULT,
-        .i2c_port = i2c_num,
-        .scl_io_num = scl_io,
-        .sda_io_num = sda_io,
-        .flags.enable_internal_pullup = true,
-    };
-
-    esp_err_t err = i2c_new_master_bus(&bus_conf, &bus_handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "I2C bus initialization failed: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    i2c_device_config_t dev_conf = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = SH1106_I2C_ADDR,
-        .scl_speed_hz = I2C_MASTER_FREQ_HZ,
-    };
-
-    err = i2c_master_bus_add_device(bus_handle, &dev_conf, &dev_handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "I2C device addition failed: %s", esp_err_to_name(err));
-        return err;
-    }
-
     oled->i2c_num = i2c_num;
     oled->address = SH1106_I2C_ADDR;
     oled->sda_io = sda_io;
     oled->scl_io = scl_io;
-    oled->width = SH1106_WIDTH;
-    oled->height = SH1106_HEIGHT;
-    memset(oled->buffer, 0, sizeof(oled->buffer));
-
     return ESP_OK;
 }
 
+
 // Send a command to the display
 esp_err_t sh1106_send_command(sh1106_t *oled, uint8_t command) {
+    if (dev_handle == NULL) {
+        ESP_LOGE(TAG, "I2C device handle is not initialized");
+        return ESP_ERR_INVALID_STATE;
+    }
+
     uint8_t data[] = {0x00, command};  // Command mode
     esp_err_t ret = i2c_master_transmit(dev_handle, data, sizeof(data), pdMS_TO_TICKS(1000));
     if (ret != ESP_OK) {
@@ -70,6 +39,7 @@ esp_err_t sh1106_send_command(sh1106_t *oled, uint8_t command) {
     }
     return ret;
 }
+
 
 // SH1106 initialization
 esp_err_t sh1106_init(sh1106_t *oled) {
@@ -131,6 +101,11 @@ void sh1106_clear(sh1106_t *oled) {
 
 // Update the display with the current buffer content
 void sh1106_update(sh1106_t *oled) {
+    if (dev_handle == NULL) {
+        ESP_LOGE(TAG, "I2C device handle is not initialized");
+        return;
+    }
+
     for (uint8_t page = 0; page < (oled->height / 8); page++) {
         sh1106_send_command(oled, SH1106_CMD_SET_PAGE | page);
         sh1106_send_command(oled, 0x02);  // Lower column address
@@ -146,7 +121,6 @@ void sh1106_update(sh1106_t *oled) {
         }
     }
 }
-
 
 void sh1106_draw_pixel(sh1106_t *oled, int x, int y, uint8_t color) {
     // Example implementation

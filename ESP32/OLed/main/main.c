@@ -1,8 +1,6 @@
 #include <stdio.h>
 #include <string.h>
 #include "driver/i2c_master.h"
-#include "driver/sdspi_host.h"
-#include "esp_vfs_fat.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "sh1106.h"
@@ -16,25 +14,18 @@
 #define I2C_MASTER_PORT         0           // I2C port number
 #define SH1106_I2C_ADDR         0x3C        // SH1106 I2C address
 
-// SD card configuration
-#define SD_MOSI_PIN             23          // GPIO for MOSI
-#define SD_MISO_PIN             19          // GPIO for MISO
-#define SD_CLK_PIN              18          // GPIO for CLK
-#define SD_CS_PIN               5           // GPIO for CS
-
 // SH1106 display dimensions
 #define SCREEN_WIDTH            128         // SH1106 width
 #define SCREEN_HEIGHT           64          // SH1106 height
-
-#define TOTAL_FRAMES            2190        // Total frames to display
-#define MOUNT_POINT             "/sdcard"
 
 static const char *TAG = "OLED_Player";
 
 // SH1106 display handle
 static sh1106_t oled;
+
+// I2C master bus and device handle
 static i2c_master_bus_handle_t bus_handle;
-static i2c_master_dev_handle_t dev_handle;
+i2c_master_dev_handle_t dev_handle;
 
 // Initialize I2C master bus and device
 esp_err_t i2c_master_init(void) {
@@ -64,87 +55,72 @@ esp_err_t i2c_master_init(void) {
         return err;
     }
 
-    ESP_LOGI(TAG, "I2C master initialized successfully");
-    return ESP_OK;
-}
-
-// Initialize SD card
-esp_err_t sd_card_init(void) {
-    esp_vfs_fat_sdmmc_mount_config_t mount_config = {
-        .format_if_mount_failed = false,
-        .max_files = 5
-    };
-
-    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
-    host.slot = SPI2_HOST;
-
-    sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
-    slot_config.gpio_cs = SD_CS_PIN;
-    slot_config.host_id = host.slot;
-
-    esp_err_t ret = esp_vfs_fat_sdspi_mount(MOUNT_POINT, &host, &slot_config, &mount_config, NULL);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to mount SD card: %s", esp_err_to_name(ret));
-        return ret;
+    if (dev_handle == NULL) {
+        ESP_LOGE(TAG, "dev_handle is NULL after i2c_master_bus_add_device()");
+        return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "SD card mounted successfully");
+    ESP_LOGI(TAG, "I2C master initialized successfully with dev_handle: %p", dev_handle);
     return ESP_OK;
 }
 
-// Display a frame from a BMP file
-void display_frame(const char *filename) {
-    FILE *file = fopen(filename, "rb");
-    if (!file) {
-        ESP_LOGE(TAG, "Failed to open file: %s", filename);
+// Display a frame received over serial
+void display_frame(uint8_t *buffer, size_t size) {
+    if (size != (SCREEN_WIDTH * SCREEN_HEIGHT / 8)) {
+        ESP_LOGE(TAG, "Incorrect frame size: expected %d bytes, got %d bytes", SCREEN_WIDTH * SCREEN_HEIGHT / 8, size);
         return;
     }
 
-    uint8_t buffer[SCREEN_WIDTH * SCREEN_HEIGHT / 8];
-    size_t bytes_read = fread(buffer, 1, sizeof(buffer), file);
-    fclose(file);
+    // Proceed if the frame size is correct
+    sh1106_clear(&oled);
+    sh1106_draw_bitmap(&oled, 0, 0, buffer, SCREEN_WIDTH, SCREEN_HEIGHT);
+    sh1106_update(&oled);
+}
 
-    if (bytes_read == sizeof(buffer)) {
-        sh1106_clear(&oled);
-        sh1106_draw_bitmap(&oled, 0, 0, buffer, SCREEN_WIDTH, SCREEN_HEIGHT);
-        sh1106_update(&oled);
-    } else {
-        ESP_LOGE(TAG, "Error reading file: %s", filename);
+// Function to receive frame data over serial
+void receive_frames_task(void *pvParameters) {
+    uint8_t buffer[SCREEN_WIDTH * SCREEN_HEIGHT / 8];
+    while (1) {
+        ESP_LOGI(TAG, "Waiting for frame data...");
+        size_t bytes_read = fread(buffer, 1, sizeof(buffer), stdin);
+        if (bytes_read == sizeof(buffer)) {
+            ESP_LOGI(TAG, "Received frame data, displaying...");
+            display_frame(buffer, bytes_read);
+        } else {
+            ESP_LOGE(TAG, "Failed to receive complete frame data");
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));  // Delay to maintain 10 fps
     }
 }
 
 void app_main(void) {
     // Initialize I2C
-    ESP_ERROR_CHECK(i2c_master_init());
+    esp_err_t ret = i2c_master_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "I2C initialization failed");
+        return;
+    }
+
     ESP_LOGI(TAG, "I2C initialized successfully");
 
     // Initialize SH1106 display
-    ESP_ERROR_CHECK(sh1106_init_desc(&oled, I2C_MASTER_PORT, I2C_MASTER_SDA_IO, I2C_MASTER_SCL_IO));
-    ESP_ERROR_CHECK(sh1106_init(&oled));
-    sh1106_clear(&oled);
-    sh1106_update(&oled);
-    ESP_LOGI(TAG, "OLED display initialized successfully");
-
-    sh1106_display_on(&oled);
-
-    // Initialize SD card
-    esp_err_t ret = sd_card_init();
+    ret = sh1106_init_desc(&oled, I2C_MASTER_PORT, I2C_MASTER_SDA_IO, I2C_MASTER_SCL_IO);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to mount SD card");
+        ESP_LOGE(TAG, "SH1106 descriptor initialization failed");
         return;
     }
-    ESP_LOGI(TAG, "SD card mounted successfully");
 
-    // Loop to display all frames
-    char filepath[64];
-    for (int i = 1; i <= TOTAL_FRAMES; i++) {
-        snprintf(filepath, sizeof(filepath), MOUNT_POINT "/converted_frames/frame_%04d.bmp", i);
-        ESP_LOGI(TAG, "Displaying frame: %s", filepath);
-        display_frame(filepath);
-        vTaskDelay(pdMS_TO_TICKS(100)); // 10 fps delay
+    ret = sh1106_init(&oled);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "SH1106 initialization failed");
+        return;
     }
 
-    ESP_LOGI(TAG, "Animation complete.");
+    sh1106_clear(&oled);
+    sh1106_update(&oled);
+    sh1106_display_on(&oled);
+    ESP_LOGI(TAG, "OLED display initialized successfully");
 
-    sh1106_display_off(&oled);
+    // Start the task to receive and display frames over serial
+    xTaskCreate(receive_frames_task, "receive_frames_task", 4096, NULL, 5, NULL);
 }
